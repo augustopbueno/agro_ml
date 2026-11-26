@@ -1,0 +1,35 @@
+name: Experimento modelos pré-treinados
+
+# Roda uma vez, só nesta branch. Não altera o main nem salva nada no repositório:
+# as previsões ficam como artefato da rodada.
+on:
+  push:
+    branches: [experimento-pretreinados]
+
+permissions:
+  contents: read
+
+jobs:
+  rodar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Instalar dependências (PyTorch só CPU)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pandas pyarrow numpy "chronos-forecasting==2.3.2" "timesfm[torch]==3.0.2"
+
+      - name: Rodar os modelos no backtest
+        run: python experimentos/modelos_pretreinados.py --so-previsoes
+
+      - name: Guardar as previsões
+        uses: actions/upload-artifact@v4
+        with:
+          name: previsoes-pretreinados
+          path: backtest_pretreinados.parquet
