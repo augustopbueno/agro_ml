@@ -24,7 +24,7 @@ Esse projeto nasceu da vontade de entender o que está por baixo, aprender sciki
 | USDA (relatório WASDE) | Estoque/consumo de soja e milho (mundo e EUA) e revisões de produção do Brasil, como publicados em cada relatório | Mensal |
 
 <!-- PERIODO:INICIO -->
-Período: outubro de 2016 a maio de 2026.
+Período usado nos modelos: julho/2016 a outubro/2026.
 <!-- PERIODO:FIM -->
 
 O CEPEA não tem API pública. As planilhas são baixadas manualmente pelo portal de consultas (detalhes no notebook 01). O resto da atualização é automático, veja a seção "Atualização mensal automática".
@@ -82,13 +82,29 @@ A validação usou walk-forward em todos os modelos, treinando no histórico at�
 ## Resultados
 
 <!-- RESULTADOS:INICIO -->
-Validação walk-forward, últimos 12 meses, horizonte de 1 mês.
+Atualizado com o CEPEA de outubro/2026.
+
+**Previsão com faixa de 80%**
+
+| Mês | Soja | Faixa 80% | Milho | Faixa 80% |
+|---|---|---|---|---|
+| novembro/2026 | R$ 149,90 | R$ 140,60 a 159,83 | R$ 66,62 | R$ 61,45 a 72,23 |
+| janeiro/2027 | R$ 149,39 | R$ 131,24 a 170,05 | R$ 69,87 | R$ 60,01 a 81,35 |
+| abril/2027 | R$ 150,03 | R$ 124,29 a 181,11 | R$ 67,31 | R$ 55,94 a 80,98 |
+
+Desde 2022, a faixa de 80% do mês seguinte pegou o preço real em 86% das vezes na soja e 89% no milho.
+
+**Validação walk-forward, últimos 12 meses, horizonte de 1 mês**
 
 | Modelo | MAPE Soja | MAPE Milho |
 |---|---|---|
-| Prophet | 7.65% | 9.57% |
-| Random Forest | 1.82% | 2.77% |
-| XGBoost | 1.82% | 3.12% |
+| Ingênuo (repete o último preço) | 3.63% | 3.30% |
+| Prophet | 6.39% | 4.42% |
+| Random Forest | 2.74% | 2.84% |
+| XGBoost | 2.59% | 2.99% |
+| Modelo da faixa (soja: média ingênuo + Ridge; milho: Ridge + USDA) | 3.40% | 3.38% |
+
+Detalhes, faixa de 95% e histórico em [reports/atualizacao_mensal.md](reports/atualizacao_mensal.md).
 <!-- RESULTADOS:FIM -->
 
 A diferença entre os modelos com lag (Random Forest e XGBoost) e o Prophet é esperada: os modelos com lag capturam autocorrelação forte da série (o preço do mês anterior explica mais de 70% da variância), enquanto o Prophet foca em tendência e sazonalidade sem usar esse sinal.
