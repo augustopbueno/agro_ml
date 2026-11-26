@@ -18,12 +18,16 @@ Esse projeto nasceu da vontade de entender o que está por baixo, aprender sciki
 
 | Fonte | Série | Periodicidade |
 |---|---|---|
-| CEPEA/ESALQ | Preço soja e milho (Paraná) | Mensal |
+| CEPEA/ESALQ | Indicador da Soja CEPEA/ESALQ (Paraná) | Mensal |
+| CEPEA/ESALQ | Indicador do Milho ESALQ/BM&FBovespa | Mensal |
 | Banco Central (SGS) | Câmbio USD/BRL, Selic, IPCA | Diária/Mensal |
+| USDA (relatório WASDE) | Estoque/consumo de soja e milho (mundo e EUA) e revisões de produção do Brasil, como publicados em cada relatório | Mensal |
 
+<!-- PERIODO:INICIO -->
 Período: outubro de 2016 a maio de 2026.
+<!-- PERIODO:FIM -->
 
-O CEPEA não tem API pública. Os dados foram baixados manualmente pelo portal de consultas e estão documentados no notebook 01.
+O CEPEA não tem API pública. As planilhas são baixadas manualmente pelo portal de consultas (detalhes no notebook 01). O resto da atualização é automático, veja a seção "Atualização mensal automática".
 
 ---
 
@@ -41,7 +45,13 @@ agro_ml/
 │   ├── 04_modelo_prophet.ipynb
 │   └── 05_modelo_sklearn.ipynb
 ├── reports/
-│   └── figures/      # gráficos gerados pelos notebooks
+│   ├── figures/                  # gráficos gerados pelos notebooks e pela atualização mensal
+│   ├── atualizacao_mensal.md     # resultado da última atualização + rascunho de post
+│   └── historico_previsoes.csv   # previsão de cada mês, para medir o erro depois
+├── src/
+│   └── atualizar.py  # pipeline completo (BCB, CEPEA, features, modelos, figuras, README)
+├── .github/workflows/
+│   └── atualizacao_mensal.yml
 ├── requirements.txt
 └── README.md
 ```
@@ -71,6 +81,7 @@ A validação usou walk-forward em todos os modelos, treinando no histórico at�
 
 ## Resultados
 
+<!-- RESULTADOS:INICIO -->
 Validação walk-forward, últimos 12 meses, horizonte de 1 mês.
 
 | Modelo | MAPE Soja | MAPE Milho |
@@ -78,10 +89,31 @@ Validação walk-forward, últimos 12 meses, horizonte de 1 mês.
 | Prophet | 7.65% | 9.57% |
 | Random Forest | 1.82% | 2.77% |
 | XGBoost | 1.82% | 3.12% |
+<!-- RESULTADOS:FIM -->
 
-O Random Forest teve o melhor desempenho em ambas as commodities. A diferença para o Prophet é esperada: os modelos com lag capturam autocorrelação forte da série (o preço do mês anterior explica mais de 70% da variância), enquanto o Prophet foca em tendência e sazonalidade sem usar esse sinal.
+A diferença entre os modelos com lag (Random Forest e XGBoost) e o Prophet é esperada: os modelos com lag capturam autocorrelação forte da série (o preço do mês anterior explica mais de 70% da variância), enquanto o Prophet foca em tendência e sazonalidade sem usar esse sinal.
 
 A previsão futura do Random Forest é mais conservadora que a do Prophet porque o forecast recursivo tende a convergir para a média. Para horizontes longos, o Prophet é mais informativo. Para o mês seguinte, o Random Forest é mais preciso.
+
+---
+
+## Atualização mensal automática
+
+O workflow `.github/workflows/atualizacao_mensal.yml` roda o `src/atualizar.py`, que refaz o pipeline dos notebooks 01, 03, 04 e 05 de ponta a ponta: atualiza câmbio, Selic e IPCA pela API do Banco Central, recalcula as features, refaz a validação walk-forward, gera a previsão com faixa de 80% e 95% para até 6 meses e as figuras, compara a previsão do mês anterior com o valor real e atualiza este README.
+
+A faixa vem de um backtest com dezenas de origens desde 2019. Na soja, o ponto é a média entre o ingênuo (repete o último preço) e um Ridge direto por horizonte. No milho, é um Ridge direto que também usa as estimativas de estoque e as revisões do relatório WASDE do USDA: no backtest, isso baixou o erro em 6 meses de cerca de 18% para 14% e deixou a faixa de 80% cerca de 35% mais estreita, nos dois subperíodos testados (2022-23 e 2024-25). Na soja, os dados do USDA não ajudaram. A largura da faixa é o quantil do erro das previsões passadas do mesmo horizonte (conformal simétrica). O intervalo próprio do Prophet foi descartado para isso porque, no mesmo teste, era largo e pegava o preço real só em cerca de metade das vezes.
+
+O relatório WASDE sai por volta do dia 10 de cada mês, e o USDA guarda os dados de cada relatório como foram publicados. O histórico desde 2016 está em `data/raw/wasde_features.csv` e o workflow baixa os relatórios novos sozinho. São dados do governo americano, de domínio público.
+
+Ele roda em três situações:
+
+- **Dia 15 de cada mês:** se a planilha do CEPEA do mês anterior ainda não estiver no repositório, abre uma issue lembrando de subir.
+- **Quando as planilhas do CEPEA são atualizadas** em `data/raw/` (upload pelo próprio GitHub).
+- **Manualmente**, pela aba Actions.
+
+Para atualizar o CEPEA: baixar as séries mensais de soja (Paraná) e milho no [portal de consultas](https://www.cepea.org.br/br/consultas-ao-banco-de-dados-do-site.aspx), de 01/01/2016 até o fim do mês anterior, renomear para `cepea_soja.xls` e `cepea_milho.xls` (sem converter) e subir em `data/raw/` com "Add file > Upload files". O site tem verificação anti-robô, por isso essa parte não dá para automatizar.
+
+Para rodar local: `pip install -r requirements.txt` e `python src/atualizar.py` (ou `--sem-bcb` para não consultar o Banco Central).
 
 ---
 

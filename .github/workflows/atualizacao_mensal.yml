@@ -1,0 +1,78 @@
+name: Atualização mensal
+
+on:
+  # Dia 15 de cada mês, 9h em Brasília (12h UTC). Nessa data o CEPEA e o IPCA do mês anterior já saíram.
+  schedule:
+    - cron: "0 12 15 * *"
+  # Roda sozinho quando as planilhas do CEPEA são atualizadas pelo GitHub
+  push:
+    branches: [main]
+    paths:
+      - "data/raw/cepea_soja.xls"
+      - "data/raw/cepea_milho.xls"
+      - "data/raw/cepea_soja.xlsx"
+      - "data/raw/cepea_milho.xlsx"
+  # Botão "Run workflow" na aba Actions
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: atualizacao-mensal
+  cancel-in-progress: false
+
+jobs:
+  atualizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Baixar o repositório
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Rodar o pipeline
+        id: pipeline
+        run: python src/atualizar.py
+
+      - name: Salvar resultados no repositório
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data reports README.md
+          if git diff --cached --quiet; then
+            echo "Nada mudou."
+          else
+            git commit -m "chore: atualização mensal (CEPEA ${{ steps.pipeline.outputs.referencia }})"
+            git push
+          fi
+
+      - name: Lembrar de subir o CEPEA
+        if: github.event_name == 'schedule' && steps.pipeline.outputs.cepea_em_dia == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MES: ${{ steps.pipeline.outputs.mes_esperado }}
+        run: |
+          TITULO="Subir planilhas do CEPEA de $MES"
+          if gh issue list --state open --search "in:title \"$TITULO\"" --json number --jq 'length' | grep -qv '^0$'; then
+            echo "Issue já existe."
+            exit 0
+          fi
+          gh issue create --title "$TITULO" --body "O CEPEA de $MES ainda não está no repositório.
+
+          1. Baixe as séries mensais (periodicidade Mensal, de 01/01/2016 até o fim do mês passado) em https://www.cepea.org.br/br/consultas-ao-banco-de-dados-do-site.aspx
+             - Soja: Indicador da Soja CEPEA/ESALQ, Paraná
+             - Milho: Indicador do Milho ESALQ/BM&FBovespa
+          2. Renomeie os arquivos para \`cepea_soja.xls\` e \`cepea_milho.xls\` (não precisa converter)
+          3. Na pasta \`data/raw/\`, use Add file > Upload files
+
+          O upload dispara o workflow, que atualiza modelos, figuras, README e o rascunho do post em \`reports/atualizacao_mensal.md\`. Pode fechar esta issue depois."
