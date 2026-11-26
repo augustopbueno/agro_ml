@@ -1,7 +1,13 @@
-data_referencia,commodity,tipo,modelo,mes_previsto,previsao,lo80,hi80,lo95,hi95
-2026-10-01,milho,faixa,Ridge com dados do USDA,2026-11-01,66.62,61.45,72.23,58.43,75.96
-2026-10-01,milho,prophet,Prophet,2026-11-01,67.71,,,,
-2026-10-01,milho,sklearn,Random Forest,2026-11-01,65.44,,,,
-2026-10-01,soja,faixa,Média ingênuo + Ridge,2026-11-01,149.9,140.6,159.83,134.55,167.01
-2026-10-01,soja,prophet,Prophet,2026-11-01,129.94,,,,
-2026-10-01,soja,sklearn,XGBoost,2026-11-01,153.42,,,,
+data_referencia,dados_ate,commodity,tipo,modelo,mes_previsto,previsao,lo80,hi80,lo95,hi95
+2026-10-01,,milho,faixa,Ridge com dados do USDA,2026-11-01,66.62,61.45,72.23,58.43,75.96
+2026-10-01,,milho,prophet,Prophet,2026-11-01,67.71,,,,
+2026-10-01,,milho,sklearn,Random Forest,2026-11-01,65.44,,,,
+2026-10-01,,soja,faixa,Média ingênuo + Ridge,2026-11-01,149.9,140.6,159.83,134.55,167.01
+2026-10-01,,soja,prophet,Prophet,2026-11-01,129.94,,,,
+2026-10-01,,soja,sklearn,XGBoost,2026-11-01,153.42,,,,
+2026-10-01,2026-11-25,milho,faixa,"Ridge com dados do USDA, a partir do preço diário",2026-11-01,67.38,67.17,67.58,67.05,67.7
+2026-10-01,2026-11-25,milho,prophet,Prophet,2026-11-01,68.13,,,,
+2026-10-01,2026-11-25,milho,sklearn,Random Forest,2026-11-01,65.46,,,,
+2026-10-01,2026-11-25,soja,faixa,Último preço diário,2026-11-01,158.27,157.73,158.8,157.45,159.09
+2026-10-01,2026-11-25,soja,prophet,Prophet,2026-11-01,129.94,,,,
+2026-10-01,2026-11-25,soja,sklearn,XGBoost,2026-11-01,153.42,,,,

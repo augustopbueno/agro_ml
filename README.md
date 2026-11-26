@@ -18,16 +18,18 @@ Esse projeto nasceu da vontade de entender o que está por baixo, aprender sciki
 
 | Fonte | Série | Periodicidade |
 |---|---|---|
-| CEPEA/ESALQ | Indicador da Soja CEPEA/ESALQ (Paraná) | Mensal |
-| CEPEA/ESALQ | Indicador do Milho ESALQ/BM&FBovespa | Mensal |
+| CEPEA/ESALQ | Indicador da Soja CEPEA/ESALQ (Paraná) | Diária |
+| CEPEA/ESALQ | Indicador do Milho ESALQ/BM&FBovespa | Diária |
 | Banco Central (SGS) | Câmbio USD/BRL, Selic, IPCA | Diária/Mensal |
 | USDA (relatório WASDE) | Estoque/consumo de soja e milho (mundo e EUA) e revisões de produção do Brasil, como publicados em cada relatório | Mensal |
 
 <!-- PERIODO:INICIO -->
-Período usado nos modelos: julho/2016 a outubro/2026.
+Período usado nos modelos: julho/2016 a outubro/2026. Preço diário até 25/11/2026.
 <!-- PERIODO:FIM -->
 
-O CEPEA não tem API pública. As planilhas são baixadas manualmente pelo portal de consultas (detalhes no notebook 01). O resto da atualização é automático, veja a seção "Atualização mensal automática".
+O CEPEA não tem API pública. As planilhas são baixadas manualmente pelo portal de consultas, na periodicidade diária. Os modelos mensais usam a média de cada mês fechado, e as previsões partem do preço diário mais recente. O resto da atualização é automático, veja a seção "Atualização mensal automática".
+
+Licença dos dados do CEPEA: CC BY-NC 4.0 (uso não comercial, citando a fonte).
 
 ---
 
@@ -36,7 +38,7 @@ O CEPEA não tem API pública. As planilhas são baixadas manualmente pelo porta
 ```
 agro_ml/
 ├── data/
-│   ├── raw/          # dados brutos (CEPEA e BCB)
+│   ├── raw/          # dados brutos (CEPEA, BCB e USDA)
 │   └── processed/    # features prontas para modelagem
 ├── notebooks/
 │   ├── 01_coleta_dados.ipynb
@@ -82,27 +84,30 @@ A validação usou walk-forward em todos os modelos, treinando no histórico at�
 ## Resultados
 
 <!-- RESULTADOS:INICIO -->
-Atualizado com o CEPEA de outubro/2026.
+Atualizado com o CEPEA até 25/11/2026.
 
 **Previsão com faixa de 80%**
 
 | Mês | Soja | Faixa 80% | Milho | Faixa 80% |
 |---|---|---|---|---|
-| novembro/2026 | R$ 149,90 | R$ 140,60 a 159,83 | R$ 66,62 | R$ 61,45 a 72,23 |
-| janeiro/2027 | R$ 149,39 | R$ 131,24 a 170,05 | R$ 69,87 | R$ 60,01 a 81,35 |
-| abril/2027 | R$ 150,03 | R$ 124,29 a 181,11 | R$ 67,31 | R$ 55,94 a 80,98 |
+| novembro/2026 (em curso) | R$ 158,27 | R$ 157,73 a 158,80 | R$ 67,38 | R$ 67,17 a 67,58 |
+| dezembro/2026 | R$ 162,98 | R$ 154,86 a 171,52 | R$ 68,99 | R$ 64,32 a 74,00 |
+| janeiro/2027 | R$ 162,98 | R$ 147,27 a 180,37 | R$ 70,41 | R$ 61,87 a 80,13 |
+| abril/2027 | R$ 162,98 | R$ 136,55 a 194,53 | R$ 67,72 | R$ 56,78 a 80,76 |
 
-Desde 2022, a faixa de 80% do mês seguinte pegou o preço real em 86% das vezes na soja e 89% no milho.
+Desde 2022, simulando a previsão no mesmo dia do mês, a faixa de 80% pegou o preço real em 81% das vezes na soja e 91% no milho para o mês em curso, e em 88% e 93% para o mês seguinte.
 
 **Validação walk-forward, últimos 12 meses, horizonte de 1 mês**
 
 | Modelo | MAPE Soja | MAPE Milho |
 |---|---|---|
-| Ingênuo (repete o último preço) | 3.63% | 3.30% |
-| Prophet | 6.39% | 4.42% |
-| Random Forest | 2.74% | 2.84% |
-| XGBoost | 2.59% | 2.99% |
-| Modelo da faixa (soja: média ingênuo + Ridge; milho: Ridge + USDA) | 3.40% | 3.38% |
+| Ingênuo (repete a média do último mês) | 3.63% | 3.29% |
+| Prophet | 6.39% | 4.35% |
+| Random Forest | 2.74% | 2.81% |
+| XGBoost | 2.59% | 3.02% |
+| Modelo da faixa (soja: último preço diário; milho: Ridge + USDA a partir do preço diário)* | 2.37% | 1.97% |
+
+\* Previsão feita no último dia útil do mês anterior, partindo do último preço diário. Os outros modelos partem da média do mês.
 
 Detalhes, faixa de 95% e histórico em [reports/atualizacao_mensal.md](reports/atualizacao_mensal.md).
 <!-- RESULTADOS:FIM -->
@@ -117,17 +122,32 @@ A previsão futura do Random Forest é mais conservadora que a do Prophet porque
 
 O workflow `.github/workflows/atualizacao_mensal.yml` roda o `src/atualizar.py`, que refaz o pipeline dos notebooks 01, 03, 04 e 05 de ponta a ponta: atualiza câmbio, Selic e IPCA pela API do Banco Central, recalcula as features, refaz a validação walk-forward, gera a previsão com faixa de 80% e 95% para até 6 meses e as figuras, compara a previsão do mês anterior com o valor real e atualiza este README.
 
-A faixa vem de um backtest com dezenas de origens desde 2019. Na soja, o ponto é a média entre o ingênuo (repete o último preço) e um Ridge direto por horizonte. No milho, é um Ridge direto que também usa as estimativas de estoque e as revisões do relatório WASDE do USDA: no backtest, isso baixou o erro em 6 meses de cerca de 18% para 14% e deixou a faixa de 80% cerca de 35% mais estreita, nos dois subperíodos testados (2022-23 e 2024-25). Na soja, os dados do USDA não ajudaram. A largura da faixa é o quantil do erro das previsões passadas do mesmo horizonte (conformal simétrica). O intervalo próprio do Prophet foi descartado para isso porque, no mesmo teste, era largo e pegava o preço real só em cerca de metade das vezes.
+A faixa vem de um backtest com dezenas de origens desde 2019. As previsões partem do preço diário mais recente do CEPEA, e não da média do mês fechado: quando a atualização roda no dia 15, metade do mês já fechou e a média do mês anterior está defasada. O mês em curso é estimado com a média dos pregões que já fecharam mais o último preço para os dias que faltam.
+
+Na soja, a previsão é o próprio último preço diário. Nenhum modelo testado bateu isso de forma consistente, nem os dados do USDA, nem modelos pré-treinados de séries temporais (Chronos e TimesFM). No milho, é um Ridge direto por horizonte que usa as estimativas de estoque e as revisões do relatório WASDE do USDA e prevê a variação a partir do preço diário.
+
+No backtest de 2022 a 2025, com a previsão feita no dia 15, usar o preço diário baixou o erro médio assim:
+
+| Horizonte | Soja antes | Soja agora | Milho antes | Milho agora |
+|---|---|---|---|---|
+| Mês em curso | 3,3% | 0,9% | 4,0% | 0,9% |
+| 1 mês depois | 5,6% | 3,8% | 7,5% | 4,8% |
+| 2 meses depois | 7,1% | 5,9% | 9,7% | 7,7% |
+| 5 meses depois | 12,0% | 10,0% | 13,8% | 12,8% |
+
+A melhora aparece em todos os anos de 2022 a 2025 nos prazos curtos. Em 5 meses ela é pequena, porque ali o que pesa é safra e câmbio.
+
+A largura da faixa é o quantil do erro das previsões passadas do mesmo horizonte (conformal simétrica), simuladas no mesmo dia do mês da rodada. Por isso a faixa do mês em curso fica estreita no fim do mês e mais larga no começo. O intervalo próprio do Prophet foi descartado para isso porque, no mesmo teste, era largo e pegava o preço real só em cerca de metade das vezes.
 
 O relatório WASDE sai por volta do dia 10 de cada mês, e o USDA guarda os dados de cada relatório como foram publicados. O histórico desde 2016 está em `data/raw/wasde_features.csv` e o workflow baixa os relatórios novos sozinho. São dados do governo americano, de domínio público.
 
 Ele roda em três situações:
 
-- **Dia 15 de cada mês:** se a planilha do CEPEA do mês anterior ainda não estiver no repositório, abre uma issue lembrando de subir.
+- **Dia 15 de cada mês:** refaz tudo com o que está no repositório e, se a planilha do CEPEA não tiver o mês anterior completo, abre uma issue lembrando de subir.
 - **Quando as planilhas do CEPEA são atualizadas** em `data/raw/` (upload pelo próprio GitHub).
 - **Manualmente**, pela aba Actions.
 
-Para atualizar o CEPEA: baixar as séries mensais de soja (Paraná) e milho no [portal de consultas](https://www.cepea.org.br/br/consultas-ao-banco-de-dados-do-site.aspx), de 01/01/2016 até o fim do mês anterior, renomear para `cepea_soja.xls` e `cepea_milho.xls` (sem converter) e subir em `data/raw/` com "Add file > Upload files". O site tem verificação anti-robô, por isso essa parte não dá para automatizar.
+Para atualizar o CEPEA: no [portal de consultas](https://www.cepea.org.br/br/consultas-ao-banco-de-dados-do-site.aspx), baixar soja (Indicador da Soja CEPEA/ESALQ, Paraná) e milho (Indicador do Milho ESALQ/BM&FBovespa) com periodicidade **Diário**, de 01/01/2016 até hoje. Renomear para `cepea_soja.xls` e `cepea_milho.xls` (sem converter) e subir em `data/raw/` com "Add file > Upload files". Quanto mais perto do fim do mês, mais o mês em curso já está fechado e mais precisa fica a previsão. O site tem verificação anti-robô, por isso essa parte não dá para automatizar. A planilha mensal ainda funciona, mas aí as previsões voltam ao método antigo, partindo da média do mês.
 
 Para rodar local: `pip install -r requirements.txt` e `python src/atualizar.py` (ou `--sem-bcb` para não consultar o Banco Central).
 
@@ -147,10 +167,9 @@ O câmbio defasado já captura parte desse efeito indiretamente, mas eventos geo
 
 El Nino e La Nina afetam diretamente a produtividade das safras brasileiras e, por consequência, o preço. A próxima versão do projeto vai incluir o índice ONI (Oceanic Nino Index) como variável exógena. Dados do INMET para temperatura e precipitação no Paraná também estão no radar.
 
-**Granularidade**
+**Futuros**
 
-Os dados do CEPEA estão disponíveis apenas em periodicidade mensal pelo portal de consultas. Para análises de curto prazo com granularidade diária, seria necessário acesso a fontes privadas.
-
+Os contratos futuros de soja e milho (B3 e Chicago) trariam a expectativa do mercado para os próximos meses, mas não encontrei fonte gratuita que permita coleta automatizada. A B3 proíbe expressamente a coleta automática dos dados do site.
 
 ---
 
