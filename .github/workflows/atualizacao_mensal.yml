@@ -1,7 +1,7 @@
 name: Atualização mensal
 
 on:
-  # Dia 15 de cada mês, 9h em Brasília (12h UTC). Nessa data o CEPEA e o IPCA do mês anterior já saíram.
+  # Dia 15 de cada mês, 9h em Brasília (12h UTC). Nessa data o IPCA do mês anterior já saiu.
   schedule:
     - cron: "0 12 15 * *"
   # Roda sozinho quando as planilhas do CEPEA são atualizadas pelo GitHub
@@ -69,7 +69,7 @@ jobs:
           fi
           gh issue create --title "$TITULO" --body "O CEPEA de $MES ainda não está no repositório.
 
-          1. Baixe as séries mensais (periodicidade Mensal, de 01/01/2016 até o fim do mês passado) em https://www.cepea.org.br/br/consultas-ao-banco-de-dados-do-site.aspx
+          1. Baixe as séries com periodicidade Diário, de 01/01/2016 até hoje, em https://www.cepea.org.br/br/consultas-ao-banco-de-dados-do-site.aspx
              - Soja: Indicador da Soja CEPEA/ESALQ, Paraná
              - Milho: Indicador do Milho ESALQ/BM&FBovespa
           2. Renomeie os arquivos para \`cepea_soja.xls\` e \`cepea_milho.xls\` (não precisa converter)

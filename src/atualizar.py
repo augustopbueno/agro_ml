@@ -180,12 +180,20 @@ def ler_planilha_cepea(path):
 
 
 def parse_cepea(path, commodity):
-    """Mesmo layout do notebook 01: cabeçalho na linha 3, data MM/YYYY, preço com vírgula decimal."""
+    """
+    Mesmo layout do notebook 01: cabeçalho na linha 3, preço com vírgula decimal.
+    A planilha pode ser a diária (data DD/MM/AAAA, a recomendada) ou a mensal (MM/AAAA).
+    Retorna (mensal, diario). Na diária, a série mensal é a média dos dias de cada mês, só com os
+    meses já fechados (bate com a série mensal do próprio CEPEA, diferença abaixo de 0,02%).
+    Na mensal, diario é None.
+    """
     df = ler_planilha_cepea(path)
     df = df.iloc[:, :3]
     df.columns = ["data", "preco_rs", "preco_usd"]
     df = df.dropna(subset=["data"])
-    df["data"] = pd.to_datetime(df["data"].astype(str).str.strip(), format="%m/%Y", errors="coerce")
+    texto = df["data"].astype(str).str.strip()
+    eh_diario = texto.str.fullmatch(r"\d{2}/\d{2}/\d{4}").mean() > 0.5
+    df["data"] = pd.to_datetime(texto, format="%d/%m/%Y" if eh_diario else "%m/%Y", errors="coerce")
     df = df.dropna(subset=["data"])
     for col in ["preco_rs", "preco_usd"]:
         df[col] = (
@@ -194,31 +202,55 @@ def parse_cepea(path, commodity):
             .str.replace(",", ".", regex=False)
         )
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["commodity"] = commodity
-    df = df.sort_values("data").reset_index(drop=True)
-    return df
+    df = df.dropna(subset=["preco_rs"]).sort_values("data").reset_index(drop=True)
+
+    if not eh_diario:
+        df["commodity"] = commodity
+        return df, None
+
+    diario = df.set_index("data")[["preco_rs", "preco_usd"]]
+    mensal = diario.resample("MS").mean()
+    ultimo_dia = diario.index.max()
+    # o mês do último pregão só entra quando não sobra dia útil depois dele
+    if len(pd.bdate_range(ultimo_dia + pd.Timedelta(days=1), ultimo_dia + pd.offsets.MonthEnd(0))):
+        mensal = mensal[mensal.index < ultimo_dia.to_period("M").to_timestamp()]
+    mensal = mensal[mensal.index >= pd.Timestamp(INICIO_HISTORICO)].dropna(subset=["preco_rs"]).round(2)
+    mensal = mensal.reset_index()
+    mensal["commodity"] = commodity
+    return mensal, diario
 
 
 def carregar_cepea():
     """
-    Aceita cepea_<commodity>.xls (do jeito que sai do site) ou .xlsx.
-    Se existirem os dois, usa o que tiver o mês mais recente.
+    Aceita cepea_<commodity>.xls (do jeito que sai do site) ou .xlsx, diária ou mensal.
+    Se existirem os dois, usa o que chegar mais perto de hoje.
+    Retorna (mensal, diario), dois dicionários por commodity. diario[commodity] é None se a
+    planilha escolhida for a mensal.
     """
-    dados = {}
+    dados, diarios = {}, {}
     for commodity in COMMODITIES:
         candidatos = []
         for ext in [".xls", ".xlsx"]:
             caminho = RAW_DIR / f"cepea_{commodity}{ext}"
             if caminho.exists():
-                candidatos.append((caminho, parse_cepea(caminho, commodity)))
+                mensal, diario = parse_cepea(caminho, commodity)
+                ate = diario.index.max() if diario is not None else mensal["data"].max() + pd.offsets.MonthEnd(0)
+                candidatos.append((ate, caminho, mensal, diario))
         if not candidatos:
             raise FileNotFoundError(f"Nenhuma planilha cepea_{commodity}.xls ou .xlsx em {RAW_DIR}")
-        caminho, df = max(candidatos, key=lambda c: c[1]["data"].max())
-        log.info("CEPEA %s: %s, %d registros | %s a %s", commodity, caminho.name, len(df),
-                 df["data"].min().date(), df["data"].max().date())
+        ate, caminho, df, diario = max(candidatos, key=lambda c: c[0])
+        log.info("CEPEA %s: %s (%s), %d meses fechados | %s a %s", commodity, caminho.name,
+                 "diária" if diario is not None else "mensal", len(df), df["data"].min().date(), df["data"].max().date())
         df.to_parquet(RAW_DIR / f"cepea_{commodity}.parquet", index=False)
+        arq_diario = RAW_DIR / f"cepea_{commodity}_diario.parquet"
+        if diario is not None:
+            log.info("CEPEA %s: preço diário até %s", commodity, diario.index.max().date())
+            diario.reset_index().to_parquet(arq_diario, index=False)
+        else:
+            arq_diario.unlink(missing_ok=True)
         dados[commodity] = df
-    return dados
+        diarios[commodity] = diario
+    return dados, diarios
 
 
 # ---------------------------------------------------------------------------
@@ -481,15 +513,23 @@ def carregar_wasde(ate):
 # ---------------------------------------------------------------------------
 #
 # Testamos várias formas de montar a faixa num backtest com 78 origens (jun/2019 a out/2025).
-# O que funcionou melhor:
-#   - soja: média entre o ingênuo (repete o último preço) e um Ridge direto por horizonte,
-#     que prevê o retorno log de t até t+h com informação disponível em t. As variáveis do
-#     USDA não melhoraram a soja.
+# O que funcionou melhor com a planilha diária do CEPEA (o caso normal):
+#   - a previsão parte do preço diário mais recente, e não da média do mês fechado. No dia 15,
+#     metade do mês corrente já fechou e a média do mês anterior está defasada. O mês corrente
+#     é estimado com a média dos dias que já fecharam mais o último preço para os dias que faltam.
+#   - soja: o último preço diário, sem ajuste. Nenhum modelo bateu isso no backtest.
 #   - milho: Ridge direto por horizonte com as variáveis do USDA (estoque/uso e revisões),
-#     padronizadas. Em 6 meses, o erro caiu de ~18% para ~14% e a faixa de 80% ficou ~35% mais
-#     estreita, nos dois subperíodos testados (2022-23 e 2024-25).
-#   - faixa: conformal simétrica, isto é, o quantil 80% (ou 95%) do erro absoluto em log das
-#     previsões passadas do mesmo horizonte, só usando origens cujo valor real já era conhecido
+#     padronizadas, prevendo a variação a partir do preço diário.
+#   - no backtest com a previsão feita no dia 15, o erro em 1 mês caiu de 3,3% para 0,9% na soja
+#     e de 4,0% para 0,9% no milho; em 2 meses, de 5,6% para 3,8% e de 7,5% para 4,8%.
+#     A melhora aparece em todos os anos de 2022 a 2025.
+# Se a planilha for a mensal, volta ao método antigo:
+#   - soja: média entre o ingênuo (repete o último preço) e um Ridge direto por horizonte.
+#   - milho: o mesmo Ridge com as variáveis do USDA, partindo da média do mês.
+# Faixa: conformal simétrica, isto é, o quantil 80% (ou 95%) do erro absoluto em log das
+# previsões passadas do mesmo horizonte, só usando origens cujo valor real já era conhecido.
+# O backtest simula todas as previsões passadas no mesmo dia do mês da rodada atual, então a
+# faixa reflete quanto do mês já se conhece.
 # O intervalo próprio do Prophet ficou largo e mesmo assim acertou só ~50% das vezes,
 # por isso ele não é mais usado para a faixa.
 
@@ -498,8 +538,10 @@ NIVEIS_FAIXA = (0.80, 0.95)
 ORIGEM_INICIAL_FAIXA = pd.Timestamp("2019-06-01")
 INICIO_AVALIACAO_FAIXA = pd.Timestamp("2022-01-01")
 MIN_RESIDUOS = 12
-METODO_FAIXA = {"soja": "media", "milho": "usda"}
-NOME_METODO_FAIXA = {"media": "Média ingênuo + Ridge", "usda": "Ridge com dados do USDA"}
+METODO_FAIXA = {"soja": "diario", "milho": "usda_diario"}
+METODO_FAIXA_MENSAL = {"soja": "media", "milho": "usda"}
+NOME_METODO_FAIXA = {"diario": "Último preço diário", "usda_diario": "Ridge com dados do USDA, a partir do preço diário",
+                     "media": "Média ingênuo + Ridge", "usda": "Ridge com dados do USDA"}
 
 
 def features_faixa(p, cambio, wasde=None, commodity=None):
@@ -523,28 +565,78 @@ def features_faixa(p, cambio, wasde=None, commodity=None):
     return X
 
 
-def prever_ponto(p, X, T, h, metodo):
-    """Previsão de t+h feita em T. Treina só com pares cujo alvo já era conhecido em T."""
+def ancoras_diarias(dia, meses, corte):
+    """
+    Para cada mês fechado T, o que o preço diário mostrava no dia `corte` do mês seguinte
+    (fechamentos até a véspera desse dia):
+      agora: estimativa da média do mês seguinte, com os dias que já fecharam e o último preço
+             repetido nos dias úteis que faltam
+      ult:   último fechamento
+      mom10: variação (log) nos últimos 10 pregões
+    """
+    linhas = {}
+    for T in meses:
+        M = T + pd.DateOffset(months=1)
+        limite = min(M + pd.Timedelta(days=corte - 1), M + pd.DateOffset(months=1))
+        ate = dia[dia.index < limite]
+        if len(ate) < 11:
+            continue
+        ult = float(ate.iloc[-1])
+        do_mes = ate[ate.index >= M]
+        uteis = len(pd.bdate_range(M, M + pd.offsets.MonthEnd(0)))
+        n = len(do_mes)
+        agora = (float(do_mes.sum()) + ult * max(uteis - n, 0)) / max(uteis, n) if n else ult
+        linhas[T] = {"agora": agora, "ult": ult, "mom10": float(np.log(ult / ate.iloc[-11]))}
+    return pd.DataFrame.from_dict(linhas, orient="index")
+
+
+def prever_ponto(p, X, T, h, metodo, ancoras=None):
+    """Previsão de T+h feita no dia da rodada. Treina só com pares cujo alvo já era conhecido."""
     lp = np.log(p)
-    alvo = lp.shift(-h) - lp
+    if metodo in ("diario", "usda_diario"):
+        ancora = np.log(ancoras["agora"] if h == 1 else ancoras["ult"]).reindex(p.index)
+        if metodo == "diario":
+            return float(np.exp(ancora.loc[T]))
+    else:
+        ancora = lp
+    alvo = lp.shift(-h) - ancora
     idx = X.index[X.index <= T - pd.DateOffset(months=h)]
     treino = pd.concat([X.loc[idx], alvo.loc[idx].rename("y")], axis=1).dropna()
-    if metodo == "usda":
+    if metodo in ("usda", "usda_diario"):
         from sklearn.pipeline import make_pipeline
         from sklearn.preprocessing import StandardScaler
         modelo = make_pipeline(StandardScaler(), Ridge(alpha=10.0)).fit(treino.drop(columns="y"), treino["y"])
-        return float(np.exp(lp.loc[T] + modelo.predict(X.loc[[T]])[0]))
+        return float(np.exp(ancora.loc[T] + modelo.predict(X.loc[[T]])[0]))
     ridge = Ridge(alpha=1.0).fit(treino.drop(columns="y"), treino["y"])
     prev_ridge = float(np.exp(lp.loc[T] + ridge.predict(X.loc[[T]])[0]))
     return (float(p.loc[T]) + prev_ridge) / 2
 
 
-def rodar_faixa(df, commodity, wasde):
+def rodar_faixa(df, commodity, wasde, diario=None):
     p = df.set_index("data")["preco_rs"]
-    metodo = METODO_FAIXA[commodity]
-    X = features_faixa(p, df.set_index("data")["usd_brl"],
-                       wasde if metodo == "usda" else None, commodity)
     ultimo = p.index.max()
+
+    ancoras, parcial = None, None
+    if diario is not None:
+        metodo = METODO_FAIXA[commodity]
+        dia = diario["preco_rs"]
+        mes_corrente = ultimo + pd.DateOffset(months=1)
+        ultimo_dia = dia.index.max()
+        # dia do mês corrente em que a rodada "acontece": o seguinte ao último pregão conhecido
+        corte = (ultimo_dia - mes_corrente).days + 2 if ultimo_dia >= mes_corrente else 1
+        ancoras = ancoras_diarias(dia, p.index, corte)
+        do_mes = dia[dia.index >= mes_corrente]
+        parcial = {"ultimo_dia": ultimo_dia, "ultimo_preco": float(dia.iloc[-1]), "pregoes": len(do_mes),
+                   "media_parcial": float(do_mes.mean()) if len(do_mes) else None, "corte": corte}
+    else:
+        metodo = METODO_FAIXA_MENSAL[commodity]
+
+    com_usda = metodo in ("usda", "usda_diario")
+    X = features_faixa(p, df.set_index("data")["usd_brl"], wasde if com_usda else None, commodity)
+    if metodo == "usda_diario":
+        a = ancoras.reindex(p.index)
+        X["base_diaria"] = np.log(a["ult"]) - np.log(p)  # último fechamento contra a média do mês
+        X["mom10"] = a["mom10"]
 
     # Backtest: todas as origens desde 2019-06 até o mês anterior ao último
     linhas = []
@@ -553,8 +645,8 @@ def rodar_faixa(df, commodity, wasde):
             alvo = T + pd.DateOffset(months=h)
             if alvo > ultimo:
                 break
-            linhas.append({"origem": T, "h": h, "prev": prever_ponto(p, X, T, h, metodo), "real": float(p.loc[alvo]),
-                           "ingenuo": float(p.loc[T])})
+            linhas.append({"origem": T, "h": h, "prev": prever_ponto(p, X, T, h, metodo, ancoras),
+                           "real": float(p.loc[alvo]), "ingenuo": float(p.loc[T])})
     bt = pd.DataFrame(linhas)
     bt["err"] = np.abs(np.log(bt["real"] / bt["prev"]))
 
@@ -575,7 +667,7 @@ def rodar_faixa(df, commodity, wasde):
     # Previsão atual, com a faixa calculada sobre todos os erros já conhecidos
     fc = []
     for h in range(1, HORIZONTE_FAIXA + 1):
-        prev = prever_ponto(p, X, ultimo, h, metodo)
+        prev = prever_ponto(p, X, ultimo, h, metodo, ancoras)
         pool = bt[bt["h"] == h]["err"]
         linha = {"ds": ultimo + pd.DateOffset(months=h), "h": h, "prev": prev}
         for n in NIVEIS_FAIXA:
@@ -584,13 +676,24 @@ def rodar_faixa(df, commodity, wasde):
             linha[f"hi{int(n * 100)}"] = prev * np.exp(q)
         fc.append(linha)
 
-    # Erro de 1 mês nos mesmos 12 meses da tabela de validação, para comparar com os outros modelos
-    ult12 = bt[(bt["h"] == 1)].tail(N_TEST)
+    # Erro de 1 mês nos mesmos 12 meses da tabela de validação, para comparar com os outros modelos.
+    # Com a planilha diária, a comparação usa a previsão feita na virada do mês (só o último
+    # preço do mês anterior), para não ganhar dos outros modelos só por já conhecer parte do mês.
+    ult12 = bt[(bt["h"] == 1)].tail(N_TEST).copy()
+    if ancoras is not None:
+        virada = ancoras_diarias(dia, p.index, 1)
+        X1 = X.copy()
+        if metodo == "usda_diario":
+            a = virada.reindex(p.index)
+            X1["base_diaria"] = np.log(a["ult"]) - np.log(p)
+            X1["mom10"] = a["mom10"]
+        ult12["prev"] = [prever_ponto(p, X1, T, 1, metodo, virada) for T in ult12["origem"]]
     return {
         "forecast": pd.DataFrame(fc),
         "acerto": acerto,
         "backtest": bt,
         "metodo": NOME_METODO_FAIXA[metodo],
+        "parcial": parcial,
         "mape_media": round(mape(ult12["real"], ult12["prev"]), 2),
         "mape_ingenuo": round(mape(ult12["real"], ult12["ingenuo"]), 2),
     }
@@ -706,14 +809,15 @@ def figura_post(datasets, resultados):
         ax.plot(hist["data"], hist["preco_rs"], color=COR[commodity], linewidth=2, label="CEPEA (real)", zorder=3)
         ax.plot(xs, [ultimo_y, *fc["prev"]], color=COR["rf"], linewidth=1.8, linestyle="--", label="Previsão", zorder=3)
 
-        p1 = fc.iloc[0]
+        p1 = fc.iloc[em_curso(resultados)]
         ax.scatter([p1["ds"]], [p1["prev"]], s=40, color=COR["rf"], edgecolors="white", linewidths=1.2, zorder=4)
         ax.annotate(f"{mes_ano(p1['ds'])}: R$ {formatar_br(p1['prev'], 0)}\n80%: R$ {formatar_br(p1['lo80'], 0)} a {formatar_br(p1['hi80'], 0)}",
                     (p1["ds"], p1["hi80"]), textcoords="offset points", xytext=(-6, 6), ha="right", va="bottom",
                     fontsize=9.5, color="#222222",
                     bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "none", "alpha": 0.9})
         ax.set_title(f"{commodity.capitalize()} (R$/saca 60 kg)", loc="left", fontsize=13, color="#222222", pad=24)
-        ax.text(0, 1.02, f"Acerto da faixa de 80% (1 mês) desde 2022: {acerto[1][0.80]:.0f}%",
+        ax.text(0, 1.02, f"Acerto da faixa de 80% para o mês seguinte, nas previsões desde 2022: "
+                f"{acerto[int(p1['h'])][0.80]:.0f}%",
                 transform=ax.transAxes, ha="left", va="bottom", fontsize=9, color="#555555")
         ax.grid(axis="y", color="#e6e6e6", linewidth=0.8)
         ax.grid(axis="x", visible=False)
@@ -727,8 +831,7 @@ def figura_post(datasets, resultados):
         ax.set_ylim(ymin, ymax + (ymax - ymin) * 0.15)
         ax.legend(frameon=False, fontsize=9, loc="upper left", ncol=3)
 
-    ref = datasets["soja"]["data"].max()
-    fig.suptitle(f"Previsão de preço para os próximos 6 meses, com o CEPEA até {mes_ano(ref)}",
+    fig.suptitle(f"Previsão de preço para os próximos meses, com o CEPEA até {texto_referencia(datasets, resultados)}",
                  x=0.01, ha="left", fontsize=14, color="#222222")
     fig.text(0.01, 0.01, "Fonte: CEPEA/ESALQ, Banco Central e USDA (WASDE). Código: github.com/augustopbueno/agro_ml",
              fontsize=8.5, color="#777777")
@@ -750,6 +853,19 @@ def mes_ano(ts):
     return f"{MESES[ts.month - 1]}/{ts.year}"
 
 
+def em_curso(resultados):
+    """1 se o mês seguinte ao último mês fechado já tem pregões na planilha diária, 0 se não."""
+    par = resultados["soja"]["faixa"]["parcial"]
+    return int(par is not None and par["pregoes"] > 0)
+
+
+def texto_referencia(datasets, resultados):
+    par = resultados["soja"]["faixa"]["parcial"]
+    if par is None:
+        return mes_ano(datasets["soja"]["data"].max())
+    return par["ultimo_dia"].strftime("%d/%m/%Y")
+
+
 def atualizar_historico(datasets, resultados):
     """Guarda a previsão do próximo mês desta rodada. Uma linha por (referência, commodity, tipo)."""
     linhas = []
@@ -759,20 +875,26 @@ def atualizar_historico(datasets, resultados):
         prox_f = r["faixa"]["forecast"].iloc[0]
         prox_s = r["sklearn_forecast"].iloc[0]
         prox_p = r["prophet"]["forecast"].iloc[0]
-        linhas.append({"data_referencia": ref, "commodity": commodity, "tipo": "faixa", "modelo": r["faixa"]["metodo"],
+        par = r["faixa"]["parcial"]
+        ate = par["ultimo_dia"] if par else pd.NaT
+        linhas.append({"data_referencia": ref, "dados_ate": ate, "commodity": commodity, "tipo": "faixa", "modelo": r["faixa"]["metodo"],
                        "mes_previsto": prox_f["ds"], "previsao": round(float(prox_f["prev"]), 2),
                        "lo80": round(float(prox_f["lo80"]), 2), "hi80": round(float(prox_f["hi80"]), 2),
                        "lo95": round(float(prox_f["lo95"]), 2), "hi95": round(float(prox_f["hi95"]), 2)})
-        linhas.append({"data_referencia": ref, "commodity": commodity, "tipo": "sklearn", "modelo": r["melhor"],
+        linhas.append({"data_referencia": ref, "dados_ate": ate, "commodity": commodity, "tipo": "sklearn", "modelo": r["melhor"],
                        "mes_previsto": prox_s["ds"], "previsao": round(float(prox_s["yhat"]), 2)})
-        linhas.append({"data_referencia": ref, "commodity": commodity, "tipo": "prophet", "modelo": "Prophet",
+        linhas.append({"data_referencia": ref, "dados_ate": ate, "commodity": commodity, "tipo": "prophet", "modelo": "Prophet",
                        "mes_previsto": prox_p["ds"], "previsao": round(float(prox_p["yhat"]), 2)})
     novo = pd.DataFrame(linhas)
     if HISTORICO.exists():
         antigo = pd.read_csv(HISTORICO, parse_dates=["data_referencia", "mes_previsto"])
+        if "dados_ate" not in antigo:
+            antigo.insert(1, "dados_ate", pd.NaT)
+        antigo["dados_ate"] = pd.to_datetime(antigo["dados_ate"])
         novo = pd.concat([antigo, novo], ignore_index=True)
-    novo = novo.drop_duplicates(["data_referencia", "commodity", "tipo"], keep="last")
-    novo = novo.sort_values(["data_referencia", "commodity", "tipo"]).reset_index(drop=True)
+    # uma linha por rodada: mesma referência e mesmo último pregão é a mesma rodada
+    novo = novo.drop_duplicates(["data_referencia", "dados_ate", "commodity", "tipo"], keep="last")
+    novo = novo.sort_values(["data_referencia", "dados_ate", "commodity", "tipo"], na_position="first").reset_index(drop=True)
     novo.to_csv(HISTORICO, index=False, date_format="%Y-%m-%d")
     return novo
 
@@ -796,17 +918,26 @@ def erro_mes_anterior(historico, datasets, commodity, tipo="faixa"):
 
 def tabela_metricas(resultados):
     linhas = ["| Modelo | MAPE Soja | MAPE Milho |", "|---|---|---|"]
+    par = resultados["soja"]["faixa"]["parcial"]
+    if par is None:
+        nome_faixa = "Modelo da faixa (soja: média ingênuo + Ridge; milho: Ridge + USDA)"
+    else:
+        nome_faixa = "Modelo da faixa (soja: último preço diário; milho: Ridge + USDA a partir do preço diário)*"
+    ingenuo = "Ingênuo (repete a média do último mês)"
     def valor(r, nome):
         if nome == "Prophet":
             return r["prophet"]["metricas"]["MAPE"]
-        if nome == "Ingênuo (repete o último preço)":
+        if nome == ingenuo:
             return r["faixa"]["mape_ingenuo"]
-        if nome == "Modelo da faixa (soja: média ingênuo + Ridge; milho: Ridge + USDA)":
+        if nome == nome_faixa:
             return r["faixa"]["mape_media"]
         return r["sklearn"][nome]["metricas"]["MAPE"]
-    for nome in ["Ingênuo (repete o último preço)", "Prophet", *MODELOS, "Modelo da faixa (soja: média ingênuo + Ridge; milho: Ridge + USDA)"]:
+    for nome in [ingenuo, "Prophet", *MODELOS, nome_faixa]:
         v = [valor(resultados[c], nome) for c in COMMODITIES]
         linhas.append(f"| {nome} | {v[0]:.2f}% | {v[1]:.2f}% |")
+    if par is not None:
+        linhas += ["", "\\* Previsão feita no último dia útil do mês anterior, partindo do último preço diário. "
+                       "Os outros modelos partem da média do mês."]
     return "\n".join(linhas)
 
 
@@ -815,23 +946,29 @@ def tabela_faixa(resultados, horizontes):
     fs, fm = resultados["soja"]["faixa"]["forecast"], resultados["milho"]["faixa"]["forecast"]
     for h in horizontes:
         a, b = fs[fs["h"] == h].iloc[0], fm[fm["h"] == h].iloc[0]
-        linhas.append(f"| {mes_ano(a['ds'])} | R$ {formatar_br(a['prev'])} | R$ {formatar_br(a['lo80'])} a {formatar_br(a['hi80'])} "
+        rotulo = mes_ano(a["ds"]) + (" (em curso)" if h == 1 and em_curso(resultados) else "")
+        linhas.append(f"| {rotulo} | R$ {formatar_br(a['prev'])} | R$ {formatar_br(a['lo80'])} a {formatar_br(a['hi80'])} "
                       f"| R$ {formatar_br(b['prev'])} | R$ {formatar_br(b['lo80'])} a {formatar_br(b['hi80'])} |")
     return "\n".join(linhas)
 
 
 def tabela_acerto(resultados):
     linhas = ["| Horizonte | Soja 80% | Soja 95% | Milho 80% | Milho 95% |", "|---|---|---|---|---|"]
+    k = em_curso(resultados)
     for h in range(1, HORIZONTE_FAIXA + 1):
         a, b = resultados["soja"]["faixa"]["acerto"][h], resultados["milho"]["faixa"]["acerto"][h]
-        linhas.append(f"| {h} {'mês' if h == 1 else 'meses'} | {a[0.80]:.0f}% | {a[0.95]:.0f}% | {b[0.80]:.0f}% | {b[0.95]:.0f}% |")
+        n = h - k
+        rotulo = "Mês em curso" if n == 0 else f"{n} {'mês' if n == 1 else 'meses'}" + (" depois" if k else "")
+        linhas.append(f"| {rotulo} | {a[0.80]:.0f}% | {a[0.95]:.0f}% | {b[0.80]:.0f}% | {b[0.95]:.0f}% |")
     return "\n".join(linhas)
 
 
 def montar_textos(datasets, resultados, historico):
     ref = datasets["soja"]["data"].max()
-    prox = ref + pd.DateOffset(months=1)
     inicio = datasets["soja"]["data"].min()
+    k = em_curso(resultados)  # 1: o mês corrente já tem pregões e a "próxima" previsão é a do mês seguinte
+    diaria = resultados["soja"]["faixa"]["parcial"] is not None
+    referencia = texto_referencia(datasets, resultados)
     bloco = {}
     for commodity in COMMODITIES:
         fx = resultados[commodity]["faixa"]
@@ -840,35 +977,54 @@ def montar_textos(datasets, resultados, historico):
             "f": fx["forecast"].set_index("h"),
             "acerto": fx["acerto"],
             "erro": erro_mes_anterior(historico, datasets, commodity),
+            "parcial": fx["parcial"],
         }
     s, m = bloco["soja"], bloco["milho"]
 
+    if diaria:
+        metodo_txt = ("As previsões partem do preço diário mais recente do CEPEA. Soja: o último preço diário, "
+                      "que no backtest não perdeu para nenhum modelo. Milho: Ridge direto por horizonte com as "
+                      "estimativas de estoque e as revisões do relatório WASDE do USDA, prevendo a variação a partir "
+                      "do preço diário. O mês em curso é estimado com a média dos pregões que já fecharam e o último "
+                      "preço repetido nos dias úteis que faltam. Faixa: quantil do erro das previsões passadas do "
+                      "mesmo horizonte, simuladas no mesmo dia do mês (conformal simétrica).")
+    else:
+        metodo_txt = ("Soja: média entre o ingênuo (repete o último preço) e um Ridge direto por horizonte. "
+                      "Milho: Ridge direto por horizonte com as estimativas de estoque e as revisões do relatório "
+                      "WASDE do USDA. Faixa: quantil do erro das previsões passadas do mesmo horizonte (conformal simétrica).")
+
     # Relatório
     rel = [
-        f"# Atualização mensal: {mes_ano(ref)}",
+        f"# Atualização mensal: CEPEA até {referencia}",
         "",
         f"Gerado em {date.today().strftime('%d/%m/%Y')} pelo workflow `atualizacao_mensal`.",
         "",
         "## Dados",
         "",
-        f"- Período usado nos modelos: {mes_ano(inicio)} a {mes_ano(ref)} ({len(datasets['soja'])} meses)",
+        f"- Período usado nos modelos: {mes_ano(inicio)} a {mes_ano(ref)} ({len(datasets['soja'])} meses fechados)",
     ]
     for commodity in COMMODITIES:
-        rel.append(f"- {commodity.capitalize()}: {NOME_SERIE[commodity]}, último valor R$ {formatar_br(bloco[commodity]['ultimo'])}/saca")
+        b = bloco[commodity]
+        linha = f"- {commodity.capitalize()}: {NOME_SERIE[commodity]}, média de {mes_ano(ref)} R$ {formatar_br(b['ultimo'])}/saca"
+        par = b["parcial"]
+        if par:
+            linha += f", último preço diário R$ {formatar_br(par['ultimo_preco'])} em {par['ultimo_dia'].strftime('%d/%m/%Y')}"
+            if par["pregoes"]:
+                linha += (f", média de {par['pregoes']} pregões de {mes_ano(ref + pd.DateOffset(months=1))} "
+                          f"R$ {formatar_br(par['media_parcial'])}")
+        rel.append(linha)
     rel += [
         "",
         "## Previsão com faixa (próximos 6 meses)",
         "",
-        "Soja: média entre o ingênuo (repete o último preço) e um Ridge direto por horizonte. "
-        "Milho: Ridge direto por horizonte com as estimativas de estoque e as revisões do relatório WASDE do USDA. "
-        "Faixa: quantil do erro das previsões passadas do mesmo horizonte (conformal simétrica).",
+        metodo_txt,
         "",
         tabela_faixa(resultados, range(1, HORIZONTE_FAIXA + 1)),
         "",
         "### Quanto a faixa acertou no passado",
         "",
         "Percentual de vezes em que o preço real caiu dentro da faixa, em previsões feitas desde jan/2022 "
-        "só com a informação disponível em cada data.",
+        "só com a informação disponível em cada data" + (", no mesmo dia do mês desta rodada." if diaria else "."),
         "",
         tabela_acerto(resultados),
         "",
@@ -894,8 +1050,10 @@ def montar_textos(datasets, resultados, historico):
         rel.append("- Ainda não há previsão de rodada anterior para comparar. A comparação aparece a partir da próxima atualização.")
 
     # Rascunho do post
-    s1, m1, s3, m3 = s["f"].loc[1], m["f"].loc[1], s["f"].loc[3], m["f"].loc[3]
-    post = [f"Atualizei meu modelo de previsão de soja e milho com os dados do CEPEA de {mes_ano(ref)}.", ""]
+    prox, depois = 1 + k, 3 + k
+    s1, m1, s3, m3 = s["f"].loc[prox], m["f"].loc[prox], s["f"].loc[depois], m["f"].loc[depois]
+    fonte = f"com os preços do CEPEA até {referencia}" if diaria else f"com os dados do CEPEA de {referencia}"
+    post = [f"Atualizei meu modelo de previsão de soja e milho {fonte}.", ""]
     if teve_erro:
         partes = []
         for commodity in COMMODITIES:
@@ -907,8 +1065,12 @@ def montar_textos(datasets, resultados, historico):
                     txt += ", dentro da faixa" if e["dentro80"] else ", fora da faixa"
                 partes.append(txt)
         post += [f"Como ele foi no mês passado: {'; '.join(partes)}.", ""]
+    if k:
+        sp, mp = s["parcial"], m["parcial"]
+        post += [f"{mes_ano(ref + pd.DateOffset(months=1)).capitalize()} ainda não fechou: nos {sp['pregoes']} pregões até agora, "
+                 f"a soja teve média de R$ {formatar_br(sp['media_parcial'])} e o milho de R$ {formatar_br(mp['media_parcial'])}.", ""]
     post += [
-        f"Para {mes_ano(prox)}: soja em R$ {formatar_br(s1['prev'])}, com 80% de chance de ficar entre "
+        f"Para {mes_ano(s1['ds'])}: soja em R$ {formatar_br(s1['prev'])}, com 80% de chance de ficar entre "
         f"R$ {formatar_br(s1['lo80'])} e R$ {formatar_br(s1['hi80'])}. Milho em R$ {formatar_br(m1['prev'])}, "
         f"entre R$ {formatar_br(m1['lo80'])} e R$ {formatar_br(m1['hi80'])}.",
         "",
@@ -917,9 +1079,12 @@ def montar_textos(datasets, resultados, historico):
         "A incerteza cresce com o prazo, e acima de 6 meses a faixa fica larga demais para ser útil, então não publico.",
         "",
         f"Testei a faixa no passado: desde 2022, a de 80% para o mês seguinte pegou o preço real em "
-        f"{s['acerto'][1][0.80]:.0f}% das vezes na soja e {m['acerto'][1][0.80]:.0f}% no milho. "
-        "O modelo usa preço passado e câmbio e, no milho, as estimativas de estoque do USDA, "
-        "que ajudaram a estreitar a faixa nos prazos maiores. Clima e custo de fertilizante ainda ficam de fora.",
+        f"{s['acerto'][prox][0.80]:.0f}% das vezes na soja e {m['acerto'][prox][0.80]:.0f}% no milho. "
+        + ("A previsão parte do preço diário mais recente e, no milho, usa também as estimativas de estoque do USDA. "
+           if diaria else
+           "O modelo usa preço passado e câmbio e, no milho, as estimativas de estoque do USDA, "
+           "que ajudaram a estreitar a faixa nos prazos maiores. ")
+        + "Clima e custo de fertilizante ainda ficam de fora.",
         "",
         "A atualização roda sozinha todo mês pelo GitHub Actions. Código e dados: github.com/augustopbueno/agro_ml",
         "",
@@ -938,15 +1103,21 @@ def montar_textos(datasets, resultados, historico):
     ]
 
     # Bloco do README
+    if k:
+        acerto_txt = (f"Desde 2022, simulando a previsão no mesmo dia do mês, a faixa de 80% pegou o preço real "
+                      f"em {s['acerto'][1][0.80]:.0f}% das vezes na soja e {m['acerto'][1][0.80]:.0f}% no milho para o mês em curso, "
+                      f"e em {s['acerto'][2][0.80]:.0f}% e {m['acerto'][2][0.80]:.0f}% para o mês seguinte.")
+    else:
+        acerto_txt = (f"Desde 2022, a faixa de 80% do mês seguinte pegou o preço real em {s['acerto'][1][0.80]:.0f}% das vezes "
+                      f"na soja e {m['acerto'][1][0.80]:.0f}% no milho.")
     readme_resultados = [
-        f"Atualizado com o CEPEA de {mes_ano(ref)}.",
+        f"Atualizado com o CEPEA até {referencia}.",
         "",
         "**Previsão com faixa de 80%**",
         "",
-        tabela_faixa(resultados, [1, 3, 6]),
+        tabela_faixa(resultados, [1, 2, 3, 6] if k else [1, 3, 6]),
         "",
-        f"Desde 2022, a faixa de 80% do mês seguinte pegou o preço real em {s['acerto'][1][0.80]:.0f}% das vezes "
-        f"na soja e {m['acerto'][1][0.80]:.0f}% no milho.",
+        acerto_txt,
         "",
         "**Validação walk-forward, últimos 12 meses, horizonte de 1 mês**",
         "",
@@ -955,6 +1126,8 @@ def montar_textos(datasets, resultados, historico):
         "Detalhes, faixa de 95% e histórico em [reports/atualizacao_mensal.md](reports/atualizacao_mensal.md).",
     ]
     readme_periodo = f"Período usado nos modelos: {mes_ano(inicio)} a {mes_ano(ref)}."
+    if diaria:
+        readme_periodo += f" Preço diário até {referencia}."
     return "\n".join(rel), "\n".join(readme_resultados), readme_periodo
 
 
@@ -993,7 +1166,7 @@ def main():
         except Exception as exc:  # a rodada segue com o histórico salvo
             log.warning("Não consegui atualizar o WASDE (%s). Seguindo com os dados salvos.", exc)
 
-    cepea = carregar_cepea()
+    cepea, diarios = carregar_cepea()
     macro, ipca = carregar_macro()
     wasde = carregar_wasde(max(df["data"].max() for df in cepea.values()))
 
@@ -1007,7 +1180,7 @@ def main():
         prophet_res = rodar_prophet(df)
         log.info("%s Prophet: MAPE %.2f%%", commodity, prophet_res["metricas"]["MAPE"])
         sk, melhor, sk_fc = rodar_sklearn(df, commodity)
-        faixa = rodar_faixa(df, commodity, wasde)
+        faixa = rodar_faixa(df, commodity, wasde, diarios[commodity])
         log.info("%s faixa: próximo mês R$ %.2f (80%%: %.2f a %.2f) | acerto histórico 80%%: %.0f%%", commodity,
                  faixa["forecast"].iloc[0]["prev"], faixa["forecast"].iloc[0]["lo80"], faixa["forecast"].iloc[0]["hi80"],
                  faixa["acerto"][1][0.80])
@@ -1031,7 +1204,9 @@ def main():
         with open(saida, "a", encoding="utf-8") as f:
             f.write(f"cepea_em_dia={'true' if em_dia else 'false'}\n")
             f.write(f"mes_esperado={MESES[esperado.month - 1]}/{esperado.year}\n")
-            f.write(f"referencia={datasets['soja']['data'].max().strftime('%Y-%m')}\n")
+            par = resultados["soja"]["faixa"]["parcial"]
+            ref = par["ultimo_dia"].strftime("%Y-%m-%d") if par else datasets["soja"]["data"].max().strftime("%Y-%m")
+            f.write(f"referencia={ref}\n")
 
 
 if __name__ == "__main__":
