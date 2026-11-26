@@ -28,6 +28,15 @@ jobs:
       - name: Rodar os modelos no backtest
         run: python experimentos/modelos_pretreinados.py --so-previsoes
 
+      - name: Imprimir as previsões no registro
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          bt = pd.read_parquet("backtest_pretreinados.parquet")
+          for r in bt.itertuples():
+              print(f"PREV|{r.commodity}|{r.origem:%Y-%m}|{r.h}|{r.metodo}|{r.prev:.4f}|{r.real:.4f}|{r.q10:.4f}|{r.q90:.4f}")
+          PY
+
       - name: Guardar as previsões
         uses: actions/upload-artifact@v4
         with:
